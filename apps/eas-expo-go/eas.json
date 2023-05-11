@@ -93,6 +93,26 @@
         },
         "simulator": false
       }
+    },
+    "publish-client": {
+      "extends": "versioned-client",
+      "env": {
+        "EAS_BUILD_PROFILE": "publish-client"
+      },
+      "android": {
+        "cache": {
+          "disabled": true
+        },
+        "withoutCredentials": true,
+        "gradleCommand": ":app:assembleVersionedRelease"
+      },
+      "ios": {
+        "resourceClass": "m-large",
+        "cache": {
+          "disabled": true
+        },
+        "simulator": true
+      }
     }
   },
   "submit": {

@@ -2,6 +2,7 @@ import { Command } from '@expo/commander';
 import plist from '@expo/plist';
 import spawnAsync from '@expo/spawn-async';
 import assert from 'assert';
+import aws from 'aws-sdk';
 import fs, { mkdirp } from 'fs-extra';
 import glob from 'glob-promise';
 import os from 'os';
@@ -9,9 +10,15 @@ import path from 'path';
 import { v4 as uuidv4 } from 'uuid';
 
 import { EXPO_DIR } from '../Constants';
+import Git from '../Git';
 import logger from '../Logger';
+import { androidAppVersionAsync, iosAppVersionAsync } from '../ProjectVersions';
+import { getSdkVersionsAsync } from '../Versions';
+
+const s3Client = new aws.S3({ region: 'us-east-1' });
 
 const RELEASE_BUILD_PROFILE = 'release-client';
+const PUBLISH_CLIENT_BUILD_PROFILE = 'publish-client';
 
 type Action = {
   name: string;
@@ -26,15 +33,37 @@ const CUSTOM_ACTIONS: Record<string, Action> = {
     actionId: 'ios-client-build-and-submit',
     action: iosBuildAndSubmitAsync,
   },
+  'ios-simulator-client-build-and-publish': {
+    name: 'Build a new iOS client and publish it to S3',
+    actionId: 'ios-simulator-client-build-and-publish',
+    action: iosSimulatorBuildAndPublishAsync,
+  },
   'android-client-build-and-submit': {
     name: 'Build a new Android client and submit it to the Play Store.',
     actionId: 'android-client-build-and-submit',
     action: androidBuildAndSubmitAsync,
   },
+  'android-client-build-and-publish': {
+    name: 'Build a new Android client and publish it to S3',
+    actionId: 'android-client-build-and-publish',
+    action: androidClientBuildAndPublishAsync,
+  },
   'remove-background-permissions-from-info-plist': {
     name: 'Removes permissions for background features that should be disabled in app store.',
     actionId: 'remove-background-permissions-from-info-plist',
     action: internalRemoveBackgroundPermissionsFromInfoPlistAsync,
+    internal: true,
+  },
+  'ios-simulator-publish': {
+    name: '[internal] Upload simulator builds to S3 and update www endpoint',
+    actionId: 'ios-simulator-publish',
+    action: internalIosSimulatorPublishAsync,
+    internal: true,
+  },
+  'android-client-publish': {
+    name: '[internal] Upload Android client to S3 and update www endpoint',
+    actionId: 'android-client-publish',
+    action: internalAndroidClientPublishAsync,
     internal: true,
   },
 };
@@ -174,6 +203,27 @@ async function iosBuildAndSubmitAsync() {
   );
 }
 
+async function iosSimulatorBuildAndPublishAsync() {
+  const projectDir = path.join(EXPO_DIR, 'apps/eas-expo-go');
+  const sdkBranchVersion = await Git.getSDKVersionFromBranchNameAsync();
+  if (!sdkBranchVersion) {
+    logger.error(`Client builds can be released only from the release branch!`);
+    process.exit(1);
+  }
+  const sdkVersions = await getSdkVersionsAsync(sdkBranchVersion); // TODO: get real version detection
+  console.log(sdkVersions);
+  throw new Error('todo');
+
+  await spawnAsync(
+    'eas',
+    ['build', '--platform', 'ios', '--profile', PUBLISH_CLIENT_BUILD_PROFILE],
+    {
+      cwd: projectDir,
+      stdio: 'inherit',
+    }
+  );
+}
+
 async function androidBuildAndSubmitAsync() {
   const isDebug = !!process.env.EXPO_DEBUG;
   const projectDir = path.join(EXPO_DIR, 'apps/eas-expo-go');
@@ -246,6 +296,27 @@ async function androidBuildAndSubmitAsync() {
   );
 }
 
+async function androidClientBuildAndPublishAsync() {
+  const projectDir = path.join(EXPO_DIR, 'apps/eas-expo-go');
+  const sdkBranchVersion = (await Git.getSDKVersionFromBranchNameAsync()) ?? '47.0.0';
+  if (!sdkBranchVersion) {
+    logger.error(`Client builds can be released only from the release branch!`);
+    process.exit(1);
+  }
+  const sdkVersions = await getSdkVersionsAsync(sdkBranchVersion); // TODO: get real version detection
+  console.log(sdkVersions);
+  throw new Error('todo');
+
+  await spawnAsync(
+    'eas',
+    ['build', '--platform', 'ios', '--profile', PUBLISH_CLIENT_BUILD_PROFILE],
+    {
+      cwd: projectDir,
+      stdio: 'inherit',
+    }
+  );
+}
+
 async function internalRemoveBackgroundPermissionsFromInfoPlistAsync(): Promise<void> {
   const INFO_PLIST_PATH = path.join(EXPO_DIR, 'ios/Exponent/Supporting/Info.plist');
   const rawPlist = await fs.readFile(INFO_PLIST_PATH, 'utf-8');
@@ -265,4 +336,78 @@ async function internalRemoveBackgroundPermissionsFromInfoPlistAsync(): Promise<
     (i: string) => !['location', 'audio', 'remote-notification'].includes(i)
   );
   await fs.writeFile(INFO_PLIST_PATH, plist.build(parsedPlist));
+}
+
+async function internalIosSimulatorPublishAsync() {
+  const tmpTarGzPath = path.join(os.tmpdir(), 'simulator.tar.gz');
+  const projectDir = path.join(EXPO_DIR, 'apps/eas-expo-go');
+  const artifactPaths = glob.sync('ios/build/Build/Products/*simulator/*.app', {
+    absolute: true,
+    cwd: projectDir,
+  });
+
+  if (artifactPaths.length !== 1) {
+    logger.error(`Expected exactly one .app directory. Found: ${artifactPaths}.`);
+  }
+  await spawnAsync('tar', ['-zcvf', tmpTarGzPath, '-C', artifactPaths[0], '.'], {
+    stdio: ['ignore', 'ignore', 'inherit'], // only stderr
+  });
+  const appVersion = await iosAppVersionAsync();
+  const file = fs.createReadStream(tmpTarGzPath);
+  console.log({
+    Bucket: 'exp-ios-simulator-apps',
+    Key: `Exponent-${appVersion}.tar.gz`,
+    Body: file,
+    ACL: 'public-read',
+  });
+  throw new Error('test');
+
+  await s3Client
+    .putObject({
+      Bucket: 'exp-ios-simulator-apps',
+      Key: `Exponent-${appVersion}.tar.gz`,
+      Body: file,
+      ACL: 'public-read',
+    })
+    .promise();
+  await modifySdkVersionsAsync(sdkVersion, (sdkVersions) => {
+    sdkVersions.iosClientUrl = `https://dpq5q02fu5f55.cloudfront.net/Exponent-${appVersion}.tar.gz`;
+    sdkVersions.iosClientVersion = appVersion;
+    return sdkVersions;
+  });
+}
+
+async function internalAndroidClientPublishAsync() {
+  const projectDir = path.join(EXPO_DIR, 'apps/eas-expo-go');
+  const artifactPaths = glob.sync('android/app/build/outputs/**/*.apk', {
+    absolute: true,
+    cwd: projectDir,
+  });
+
+  if (artifactPaths.length !== 1) {
+    logger.error(`Expected exactly one .apk file. Found: ${artifactPaths}`);
+  }
+  const appVersion = await androidAppVersionAsync();
+  const file = fs.createReadStream(artifactPaths[0]);
+
+  console.log({
+    Bucket: 'exp-android-apks',
+    Key: `Exponent-${appVersion}.apk`,
+    Body: file,
+    ACL: 'public-read',
+  });
+  throw new Error('test');
+  await s3Client
+    .putObject({
+      Bucket: 'exp-android-apks',
+      Key: `Exponent-${appVersion}.apk`,
+      Body: file,
+      ACL: 'public-read',
+    })
+    .promise();
+  await modifySdkVersionsAsync(sdkVersion, (sdkVersions) => {
+    sdkVersions.androidClientUrl = `https://d1ahtucjixef4r.cloudfront.net/Exponent-${appVersion}.apk`;
+    sdkVersions.androidClientVersion = appVersion;
+    return sdkVersions;
+  });
 }

@@ -47,3 +47,11 @@ if [[ "$EAS_BUILD_PROFILE" == "release-client" ]]; then
 
   notify_slack "$TITLE" "$MESSAGE"
 fi
+
+if [[ "$EAS_BUILD_PROFILE" == "publish-client" ]]; then
+  if [[ "$EAS_BUILD_PLATFORM" == "android" ]]; then
+    et eas android-client-publish
+  elif [[ "$EAS_BUILD_PLATFORM" == "ios" ]]; then
+    et eas ios-simulator-publish
+  fi
+fi
